@@ -1,15 +1,21 @@
 """
 git_diff_copy_gui.py
 
-Pick changed files in a git repository, export their HEAD/current versions as
-*.before and *.after, then send those pairs plus SKILL.md to a web LLM for a
-Traditional Chinese commit message.
+Pick changed files in a git repository, gather their HEAD/current versions as
+before/after content (entirely in memory, no output folder written to disk),
+then send those pairs plus SKILL.md to a web LLM for a Traditional Chinese
+commit message.
 
 新增功能：
 - 「暫存待送出清單」— 可以分別從不同資料夾/檔案，多次加入清單，
   最後再一次送出，藉此達成「跨資料夾選擇檔案」的效果。
 - 記住上一次瀏覽的資料夾（僅限本次程式執行期間，暫時性），
   讓下次開啟選擇視窗時能接續上次的位置，減少來回切換資料夾的麻煩。
+
+設計變更：
+- 不再把 before/after 內容寫成 .before / .after 檔案到
+  git_diff_copy_output 資料夾。所有內容都在記憶體中讀取、組合成 prompt，
+  送出後即可捨棄，不會在磁碟上留下任何暫存檔案或資料夾。
 """
 
 import os
@@ -36,8 +42,8 @@ PASTE_DELAY_SECONDS = 5
 @dataclass
 class DiffPair:
     rel_path: str
-    before_path: str
-    after_path: str
+    before_content: bytes
+    after_content: bytes
     is_new: bool = False
 
 
@@ -92,15 +98,17 @@ def read_all_bytes(path, retries=5, retry_delay=0.2):
     raise RuntimeError(f"無法完整讀取檔案，已重試 {retries} 次仍失敗：{last_error}")
 
 
-def read_text_file(path):
-    raw = read_all_bytes(path)
-
+def decode_bytes_to_text(raw):
     for encoding in ("utf-8-sig", "utf-8", "cp950", "big5"):
         try:
             return raw.decode(encoding)
         except UnicodeDecodeError:
             pass
     return raw.decode("utf-8", errors="replace")
+
+
+def read_text_file(path):
+    return decode_bytes_to_text(read_all_bytes(path))
 
 
 def find_git_root(path):
@@ -147,70 +155,34 @@ def is_file_modified(repo_root, rel_path):
     return bool(result.stdout.strip())
 
 
-def unique_pair_paths(out_dir, rel_path, repo_prefix=None):
-    """組出 .before / .after 的輸出路徑。
-
-    當多個檔案（可能來自不同 git repository）要匯出到同一個共用資料夾時，
-    加上 repo_prefix（通常是 repo 根目錄的資料夾名稱）可避免不同 repo
-    但相對路徑相同的檔案互相覆蓋。
-    """
-    safe_name = rel_path.replace("/", "__").replace("\\", "__")
-    if repo_prefix:
-        safe_name = f"{repo_prefix}__{safe_name}"
-    return (
-        os.path.join(out_dir, safe_name + ".before"),
-        os.path.join(out_dir, safe_name + ".after"),
-    )
-
-
-def process_single_file(repo_root, abs_file_path, out_dir, log, use_repo_prefix=False):
+def process_single_file(repo_root, abs_file_path, log):
+    """讀取單一檔案的 before/after 內容，全程在記憶體中處理，不寫入磁碟。"""
     rel_path = os.path.relpath(abs_file_path, repo_root).replace("\\", "/")
-    repo_prefix = os.path.basename(os.path.normpath(repo_root)) if use_repo_prefix else None
-    before_path, after_path = unique_pair_paths(out_dir, rel_path, repo_prefix=repo_prefix)
 
     is_new = not file_exists_in_head(repo_root, rel_path)
 
     if not is_new:
-        content = get_head_content(repo_root, rel_path)
-        with open(before_path, "wb") as f:
-            f.write(content)
-
-        written_size = os.path.getsize(before_path)
-        if written_size != len(content):
-            raise RuntimeError(
-                f"寫入 {before_path} 時發生截斷：預期 {len(content)} bytes，"
-                f"實際寫入 {written_size} bytes"
-            )
-        log(f"[before] {rel_path} -> {before_path}")
+        before_content = get_head_content(repo_root, rel_path)
+        log(f"[before] {rel_path} 已讀取 HEAD 版本內容（{len(before_content):,} bytes）")
     else:
-        open(before_path, "wb").close()
+        before_content = b""
         log(f"[before] {rel_path} 為新增檔案，HEAD 中不存在")
 
     after_content = read_all_bytes(abs_file_path)
-    with open(after_path, "wb") as dst:
-        dst.write(after_content)
+    log(f"[after]  {rel_path} 已讀取目前版本內容（{len(after_content):,} bytes）")
 
-    # 寫入後再驗證一次輸出檔案大小，確認沒有寫到一半就被中斷
-    written_size = os.path.getsize(after_path)
-    if written_size != len(after_content):
-        raise RuntimeError(
-            f"寫入 {after_path} 時發生截斷：預期 {len(after_content)} bytes，"
-            f"實際寫入 {written_size} bytes"
-        )
-    log(f"[after]  {rel_path} -> {after_path}")
-
-    return DiffPair(rel_path=rel_path, before_path=before_path, after_path=after_path, is_new=is_new)
+    return DiffPair(
+        rel_path=rel_path,
+        before_content=before_content,
+        after_content=after_content,
+        is_new=is_new,
+    )
 
 
-def collect_for_path(target_path, log, out_dir=None):
+def collect_for_path(target_path, log):
     repo_root = find_git_root(target_path)
     if not repo_root:
         raise RuntimeError("選取的位置不在 git repository 裡。")
-
-    if out_dir is None:
-        base_dir = os.path.dirname(target_path) if os.path.isfile(target_path) else target_path
-        out_dir = os.path.join(base_dir, "git_diff_copy_output")
-    os.makedirs(out_dir, exist_ok=True)
 
     pairs = []
     if os.path.isfile(target_path):
@@ -218,7 +190,7 @@ def collect_for_path(target_path, log, out_dir=None):
         if not is_file_modified(repo_root, rel_path):
             log(f"[skip] {rel_path} 相對 HEAD 沒有變更，略過")
         else:
-            pairs.append(process_single_file(repo_root, target_path, out_dir, log))
+            pairs.append(process_single_file(repo_root, target_path, log))
     else:
         for root, _, files in os.walk(target_path):
             if ".git" in root.split(os.sep):
@@ -227,18 +199,18 @@ def collect_for_path(target_path, log, out_dir=None):
                 abs_path = os.path.join(root, fname)
                 rel_path = os.path.relpath(abs_path, repo_root).replace("\\", "/")
                 if is_file_modified(repo_root, rel_path):
-                    pairs.append(process_single_file(repo_root, abs_path, out_dir, log))
+                    pairs.append(process_single_file(repo_root, abs_path, log))
 
     if not pairs:
         log("沒有找到相對 HEAD 有變更的檔案。")
 
-    return repo_root, out_dir, pairs
+    return repo_root, pairs
 
 
 def list_modified_files_in_dir(target_path):
     """走訪資料夾，回傳所有相對 HEAD 有變更（含未追蹤）的檔案絕對路徑清單。
 
-    只列出清單，不做任何 before/after 匯出，供「暫存待送出清單」功能使用。
+    只列出清單，不做任何內容讀取，供「暫存待送出清單」功能使用。
     """
     if not os.path.isdir(target_path):
         raise RuntimeError(f"{target_path} 不是資料夾。")
@@ -260,22 +232,15 @@ def list_modified_files_in_dir(target_path):
     return results
 
 
-def collect_for_multiple_files(target_paths, log, out_dir=None):
+def collect_for_multiple_files(target_paths, log):
     """處理一批檔案；這批檔案可以分別位於不同資料夾、甚至不同 git repository。
 
-    不論檔案原本位於哪裡，產生的 .before / .after 都會統一寫入同一個
-    out_dir。若沒有指定 out_dir，預設會用「清單中第一個檔案所在資料夾」底下
-    的 git_diff_copy_output 作為這次批次共用的輸出資料夾。
+    每個檔案各自從自己所屬的 repository 讀取 before/after 內容，全程在記憶體
+    中處理，不會在磁碟上留下任何檔案。
     """
     if not target_paths:
         raise RuntimeError("沒有可處理的檔案。")
 
-    if out_dir is None:
-        out_dir = os.path.join(os.path.dirname(target_paths[0]), "git_diff_copy_output")
-    os.makedirs(out_dir, exist_ok=True)
-
-    # 第一輪：先判斷每個檔案的 repo_root，並過濾掉沒變更 / 不在 repo 內的項目。
-    # 這樣才能在真正處理前，知道這批檔案是否橫跨多個 repository。
     to_process = []
     repo_roots = set()
     skipped = []
@@ -296,12 +261,8 @@ def collect_for_multiple_files(target_paths, log, out_dir=None):
         to_process.append((repo_root, target_path))
         repo_roots.add(repo_root)
 
-    # 一旦這批檔案橫跨超過一個 repo，就統一替所有檔名加上 repo 前綴，
-    # 避免不同 repo 但相對路徑相同的檔案在同一個輸出資料夾裡互相覆蓋。
-    use_repo_prefix = len(repo_roots) > 1
-
     pairs = [
-        process_single_file(repo_root, target_path, out_dir, log, use_repo_prefix=use_repo_prefix)
+        process_single_file(repo_root, target_path, log)
         for repo_root, target_path in to_process
     ]
 
@@ -312,7 +273,7 @@ def collect_for_multiple_files(target_paths, log, out_dir=None):
         log(f"[skip] {len(skipped)} file(s) were outside git repositories or unmodified")
 
     repo_root = sorted(repo_roots)[0] if repo_roots else None
-    return repo_root, out_dir, pairs
+    return repo_root, pairs
 
 
 def build_llm_prompt(pairs, skill_md_path):
@@ -329,7 +290,7 @@ def build_llm_prompt(pairs, skill_md_path):
     ]
 
     for pair in pairs:
-        after_text = read_text_file(pair.after_path)
+        after_text = decode_bytes_to_text(pair.after_content)
         if pair.is_new:
             chunks.extend(
                 [
@@ -339,7 +300,7 @@ def build_llm_prompt(pairs, skill_md_path):
                 ]
             )
         else:
-            before_text = read_text_file(pair.before_path)
+            before_text = decode_bytes_to_text(pair.before_content)
             chunks.extend(
                 [
                     "",
@@ -432,7 +393,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Git before/after commit message helper")
-        root.geometry("820x760")
+        root.geometry("820x740")
         self.last_prompt = ""
         self.ignored_prompts = set()
         self.waiting_for_response = False
@@ -450,19 +411,11 @@ class App:
         tk.Entry(top_frame, textvariable=self.url_var, width=70).grid(row=0, column=1, sticky="ew", padx=6, columnspan=2)
         top_frame.columnconfigure(1, weight=1)
 
-        tk.Label(top_frame, text="統一輸出資料夾").grid(row=1, column=0, sticky="w", pady=(4, 0))
-        self.output_dir_var = tk.StringVar(value="")
-        tk.Entry(top_frame, textvariable=self.output_dir_var, width=58).grid(
-            row=1, column=1, sticky="ew", padx=6, pady=(4, 0)
-        )
-        tk.Button(top_frame, text="瀏覽...", command=self.browse_output_dir).grid(
-            row=1, column=2, sticky="w", pady=(4, 0)
-        )
         tk.Label(
             top_frame,
-            text="留空 = 自動使用「本次選取的第一個檔案所在資料夾」作為這次批次共用的輸出資料夾。",
+            text="before/after 內容全程僅在記憶體中處理，不會寫入磁碟或產生暫存資料夾。",
             fg="gray40",
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         settings_frame = tk.Frame(root)
         settings_frame.pack(fill=tk.X, padx=10, pady=4)
@@ -555,31 +508,6 @@ class App:
         self.result_box.insert(tk.END, text.strip() + "\n")
         self.result_box.see(tk.END)
 
-    def browse_output_dir(self):
-        path = filedialog.askdirectory(
-            title="選擇統一輸出資料夾", initialdir=self.output_dir_var.get().strip() or self.last_browse_dir or None
-        )
-        if path:
-            self.output_dir_var.set(path)
-            self.log(f"已設定統一輸出資料夾：{path}")
-
-    def get_output_dir(self, fallback_paths):
-        """回傳這次批次要使用的共用輸出資料夾。
-
-        若使用者在「統一輸出資料夾」欄位有填值，一律使用該資料夾（不論檔案原本
-        位於哪裡）；否則預設用 fallback_paths 中第一個檔案所在資料夾，讓同一批次
-        的所有檔案仍然共用同一個輸出資料夾。
-        """
-        configured = self.output_dir_var.get().strip()
-        if configured:
-            os.makedirs(configured, exist_ok=True)
-            return configured
-        if fallback_paths:
-            base = fallback_paths[0]
-            base_dir = os.path.dirname(base) if os.path.isfile(base) else base
-            return os.path.join(base_dir, "git_diff_copy_output")
-        return None
-
     def capture_mouse_coords(self):
         self.log("請將滑鼠移至複製按鈕上方，3秒後將自動記錄座標...")
         self.root.after(3000, self._do_capture_mouse)
@@ -663,16 +591,15 @@ class App:
             messagebox.showwarning("清單是空的", "請先用「加入檔案／加入多個檔案／加入資料夾內變更檔案」把要送出的檔案加入清單。")
             return
         try:
-            out_dir = self.get_output_dir(self.pending_paths)
-            repo_root, out_dir, pairs = collect_for_multiple_files(list(self.pending_paths), self.log, out_dir=out_dir)
-            self.send_pairs_to_llm(repo_root, out_dir, pairs)
+            repo_root, pairs = collect_for_multiple_files(list(self.pending_paths), self.log)
+            self.send_pairs_to_llm(repo_root, pairs)
         except Exception as exc:
             messagebox.showerror("錯誤", str(exc))
 
     # ------------------------------------------------------------------
     # 送出到 LLM 與等待回傳（原本邏輯，不變）
     # ------------------------------------------------------------------
-    def send_pairs_to_llm(self, repo_root, out_dirs, pairs):
+    def send_pairs_to_llm(self, repo_root, pairs):
         if not pairs:
             messagebox.showwarning("沒有變更", "沒有可送出的 before/after 內容。")
             return
@@ -687,11 +614,7 @@ class App:
         else:
             self.log("找不到 SKILL.md，仍會送出 before/after 內容。")
 
-        if isinstance(out_dirs, str):
-            out_dir_text = out_dirs
-        else:
-            out_dir_text = "\n".join(out_dirs)
-        self.log(f"輸出位置：\n{out_dir_text}")
+        self.log(f"已在記憶體中處理 {len(pairs)} 個檔案，未寫入任何暫存檔案。")
         self.log(f"已複製 prompt 到剪貼簿，共 {len(prompt):,} 字元。")
 
         url = self.url_var.get().strip() or DEFAULT_LLM_URL
@@ -767,9 +690,8 @@ class App:
             self._remember_browse_dir(path)
             self.log(f"選取檔案：{path}")
             try:
-                out_dir = self.get_output_dir([path])
-                repo_root, out_dir, pairs = collect_for_path(path, self.log, out_dir=out_dir)
-                self.send_pairs_to_llm(repo_root, out_dir, pairs)
+                repo_root, pairs = collect_for_path(path, self.log)
+                self.send_pairs_to_llm(repo_root, pairs)
             except Exception as exc:
                 messagebox.showerror("錯誤", str(exc))
 
@@ -781,9 +703,8 @@ class App:
             for path in paths:
                 self.log(f"  - {path}")
             try:
-                out_dir = self.get_output_dir(list(paths))
-                repo_root, out_dir, pairs = collect_for_multiple_files(list(paths), self.log, out_dir=out_dir)
-                self.send_pairs_to_llm(repo_root, out_dir, pairs)
+                repo_root, pairs = collect_for_multiple_files(list(paths), self.log)
+                self.send_pairs_to_llm(repo_root, pairs)
             except Exception as exc:
                 messagebox.showerror("錯誤", str(exc))
 
@@ -793,9 +714,8 @@ class App:
             self._remember_browse_dir(path)
             self.log(f"選取資料夾：{path}")
             try:
-                out_dir = self.get_output_dir([path])
-                repo_root, out_dir, pairs = collect_for_path(path, self.log, out_dir=out_dir)
-                self.send_pairs_to_llm(repo_root, out_dir, pairs)
+                repo_root, pairs = collect_for_path(path, self.log)
+                self.send_pairs_to_llm(repo_root, pairs)
             except Exception as exc:
                 messagebox.showerror("錯誤", str(exc))
 
