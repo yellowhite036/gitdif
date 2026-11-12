@@ -35,7 +35,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 
 
-DEFAULT_LLM_URL = "https://chatgpt.com/"
+DEFAULT_LLM_URL = "https://claude.ai/new"
 PASTE_DELAY_SECONDS = 5
 
 
@@ -348,11 +348,11 @@ def paste_text_with_hotkey(delay_seconds, wait_for_reply, coord_x, coord_y, log=
             else:
                 subprocess.run(["xdotool", "key", "Return"], check=False)
 
-        # 1. 貼上大量內容 (如果過長，ChatGPT 會轉成檔案附件)
+        # 1. 貼上大量內容 (如果過長，Claude 會轉成檔案附件)
         do_paste()
         time.sleep(1.0)
         
-        # 2. 若 ChatGPT 轉成附件，需要一段短語來觸發它執行
+        # 2. 若 Claude 轉成附件，需要一段短語來觸發它執行
         if set_clip_cb:
             short_prompt = "請根據上述或附檔內容與 SKILL.md 規則，產出 git commit message。只回傳 commit message 本文，不要加說明，並請務必使用 Markdown code block 包裝您的回覆。"
             set_clip_cb(short_prompt)
